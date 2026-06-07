@@ -198,50 +198,53 @@ def is_postable(pin: dict) -> bool:
     return pin.get("status") == "verified"
 
 
-def build_event_content(etype: str, payload) -> str:
+EVENT_COLORS = {
+    "breach": 0xC0392B,
+    "mission": 0xF1C40F,
+    "bloodmoney": 0x884EA0,
+}
+
+
+def build_event_embed(etype: str, payload) -> dict | None:
     if etype == "breach":
         d = payload
-        return (
-            f"**Breach in 10 minutes**: {d['breach']} (20:00 BST, multi-combat, 30 min)\n"
-            f"Ancient Warriors' weapons drop 1/90, corrupted 1/80. Attacking skulls you.\n"
-            f"{LINKS_LINE}"
-        )
+        return {
+            "title": "Breach in 10 minutes",
+            "description": f"**{d['breach']}** at 20:00 BST\nMulti-combat for 30 minutes. Attacking a breach monster skulls you.\n\n{LINKS_LINE}",
+            "color": EVENT_COLORS["breach"],
+            "footer": {"text": "dmmradar.com"},
+        }
     if etype == "mission":
         tier, bst = payload
-        return (
-            f"**Mission posting in 10 minutes**: {tier} reward ({bst})\n"
-            f"Bring the totem to the totem trader at the Grand Exchange. Holder is red-skulled.\n"
-            f"{LINKS_LINE}"
-        )
+        return {
+            "title": "Mission posting in 10 minutes",
+            "description": f"**{tier}** reward, posts at **{bst}**.\n\n{LINKS_LINE}",
+            "color": EVENT_COLORS["mission"],
+            "footer": {"text": "dmmradar.com"},
+        }
     if etype == "bloodmoney":
         d = payload
         single, multi, breach_bm, death = d["bm"]
-        breach_str = "n/a" if breach_bm is None else str(breach_bm)
-        lines = [
-            f"**Day {d['n']} ({d['label']})**",
-            "",
-            "Blood money:",
-            f"- Single kill: {single}",
-            f"- Multi kill: {multi}",
-            f"- Breach kill: {breach_str}",
-            f"- Death: {death}",
-            "",
-        ]
-        if d["breach"]:
-            lines.append(f"Breach: **{d['breach']}** at 20:00 BST (multi-combat, 30 min)")
-        else:
-            lines.append("Breach: none today (final day)")
+        breach_bm_str = "n/a" if breach_bm is None else str(breach_bm)
+        breach_line = f"**{d['breach']}** at 20:00 BST" if d["breach"] else "no breach (final day)"
         missions = []
         if d["m1"]:
             missions.append(f"{d['m1']} at 16:00 BST")
         if d["m2"]:
             missions.append(f"{d['m2']} at 00:00 BST")
-        if missions:
-            lines.append("Missions: " + ", ".join(missions))
-        lines.append("")
-        lines.append(LINKS_LINE)
-        return "\n".join(lines)
-    return ""
+        missions_line = "\n".join(missions) if missions else "none listed"
+        return {
+            "title": f"Day {d['n']} - {d['label']}",
+            "color": EVENT_COLORS["bloodmoney"],
+            "fields": [
+                {"name": "Blood money", "value": f"Single: **{single}**\nMulti: **{multi}**\nBreach: **{breach_bm_str}**\nDeath: **{death}**", "inline": True},
+                {"name": "Breach", "value": breach_line, "inline": True},
+                {"name": "Missions", "value": missions_line, "inline": False},
+            ],
+            "description": LINKS_LINE,
+            "footer": {"text": "dmmradar.com"},
+        }
+    return None
 
 
 def process_events(state: dict[str, dict]) -> None:
@@ -260,9 +263,9 @@ def process_events(state: dict[str, dict]) -> None:
             state[eid] = {"status": "missed"}
             save_state(state)
             continue
-        content = build_event_content(etype, payload)
-        if content:
-            post_webhook({"content": content}, EVENTS_WEBHOOK_URL)
+        embed = build_event_embed(etype, payload)
+        if embed:
+            post_webhook({"embeds": [embed]}, EVENTS_WEBHOOK_URL)
             print(f"[{time.strftime('%H:%M:%S')}] event fired: {eid}", flush=True)
         state[eid] = {"status": "fired"}
         save_state(state)
