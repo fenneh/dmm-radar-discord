@@ -15,8 +15,45 @@ MAP_URL = "https://dmmradar.com/map"
 STATE_FILE = Path(os.environ.get("STATE_FILE", "/app/data/seen.json"))
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "45"))
 WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
+EVENTS_WEBHOOK_URL = (os.environ.get("EVENTS_WEBHOOK_URL") or WEBHOOK_URL).strip()
 USER_AGENT = "dmm-radar-discord/0.1 (+https://github.com/fenneh)"
 WATCH_TTL = timedelta(hours=int(os.environ.get("WATCH_TTL_HOURS", "12")))
+EVENT_LEAD = timedelta(minutes=int(os.environ.get("EVENT_LEAD_MINUTES", "10")))
+
+DAYS = [
+    {"n": 1, "date": "2026-06-06", "label": "Jun 6", "bm": (1, 1, 2, -1), "breach": "Mole Hole", "m1": "Tier 2", "m2": "Tier 4"},
+    {"n": 2, "date": "2026-06-07", "label": "Jun 7", "bm": (2, 1, 2, -1), "breach": "Rogues' Castle", "m1": "Tier 4", "m2": "Tier 3"},
+    {"n": 3, "date": "2026-06-08", "label": "Jun 8", "bm": (3, 1, 2, -1), "breach": "Al Kharid (Shantay Pass + Kalphite Cave area)", "m1": "Tier 3", "m2": "Tier 3"},
+    {"n": 4, "date": "2026-06-09", "label": "Jun 9", "bm": (4, 2, 2, -1), "breach": "Middle of the Wilderness", "m1": "Tier 3", "m2": "Tier 2"},
+    {"n": 5, "date": "2026-06-10", "label": "Jun 10", "bm": (5, 2, 3, -1), "breach": "South Varlamore (Colossal Wyrm Remains)", "m1": "Tier 3", "m2": "Tier 1"},
+    {"n": 6, "date": "2026-06-12", "label": "Jun 12", "bm": (6, 2, 3, -1), "breach": "Mor Ul Rek", "m1": "Tier 2", "m2": "Tier 2"},
+    {"n": 7, "date": "2026-06-13", "label": "Jun 13", "bm": (6, 2, 3, -1), "breach": "Ape Atoll", "m1": "Tier 3", "m2": "Tier 1"},
+    {"n": 8, "date": "2026-06-14", "label": "Jun 14", "bm": (6, 2, 4, -1), "breach": "Port Piscarilius (bank + anglerfish area)", "m1": "Tier 2", "m2": "Tier 1"},
+    {"n": 9, "date": "2026-06-15", "label": "Jun 15", "bm": (6, 2, None, -1), "breach": None, "m1": None, "m2": None},
+]
+
+
+def _build_schedule() -> list[tuple]:
+    sched: list[tuple] = []
+    for d in DAYS:
+        date_str = d["date"]
+        sched.append((f"bloodmoney-{date_str}", f"{date_str}T09:00:00+00:00", "bloodmoney", d))
+        if d["breach"]:
+            sched.append((f"breach-{date_str}", f"{date_str}T19:00:00+00:00", "breach", d))
+        if d["m1"]:
+            sched.append((f"mission-{date_str}-16bst", f"{date_str}T15:00:00+00:00", "mission", (d["m1"], "16:00 BST")))
+        if d["m2"]:
+            sched.append((f"mission-{date_str}-00bst", f"{date_str}T23:00:00+00:00", "mission", (d["m2"], "00:00 BST next day")))
+    return sched
+
+
+SCHEDULE = _build_schedule()
+
+EVENT_GRACE = timedelta(hours=1)
+
+HISCORES_URL = "https://dmmallstars3hiscores.pages.dev/"
+STREAMS_URL = "https://dmmallstars.stream/"
+LINKS_LINE = f"[hiscores]({HISCORES_URL}) · [streams]({STREAMS_URL})"
 
 TEAM_COLORS = {
     "odablock_team": 0xE67E22,
@@ -106,6 +143,7 @@ def build_embed(pin: dict, teams: dict[str, dict]) -> dict:
     confirmations = pin.get("confirmations")
     if confirmations is not None:
         desc_lines.append(f"`{pin.get('status')}` · {confirmations} confirmations")
+    desc_lines.append(LINKS_LINE)
 
     embed = {
         "title": f"{killer_name} → {victim_name}",
@@ -121,12 +159,13 @@ def build_embed(pin: dict, teams: dict[str, dict]) -> dict:
     return embed
 
 
-def post_webhook(payload: dict) -> None:
-    if not WEBHOOK_URL:
-        raise SystemExit("DISCORD_WEBHOOK_URL not set")
+def post_webhook(payload: dict, url: str | None = None) -> None:
+    target = url or WEBHOOK_URL
+    if not target:
+        raise SystemExit("webhook url not set")
     body = json.dumps(payload).encode()
     req = urllib.request.Request(
-        WEBHOOK_URL,
+        target,
         data=body,
         headers={"Content-Type": "application/json", "User-Agent": USER_AGENT},
         method="POST",
@@ -157,6 +196,76 @@ def post_pin(pin: dict, teams: dict[str, dict]) -> list[str]:
 
 def is_postable(pin: dict) -> bool:
     return pin.get("status") == "verified"
+
+
+def build_event_content(etype: str, payload) -> str:
+    if etype == "breach":
+        d = payload
+        return (
+            f"**Breach in 10 minutes**: {d['breach']} (20:00 BST, multi-combat, 30 min)\n"
+            f"Ancient Warriors' weapons drop 1/90, corrupted 1/80. Attacking skulls you.\n"
+            f"{LINKS_LINE}"
+        )
+    if etype == "mission":
+        tier, bst = payload
+        return (
+            f"**Mission posting in 10 minutes**: {tier} reward ({bst})\n"
+            f"Bring the totem to the totem trader at the Grand Exchange. Holder is red-skulled.\n"
+            f"{LINKS_LINE}"
+        )
+    if etype == "bloodmoney":
+        d = payload
+        single, multi, breach_bm, death = d["bm"]
+        breach_str = "n/a" if breach_bm is None else str(breach_bm)
+        lines = [
+            f"**Day {d['n']} ({d['label']})**",
+            "",
+            "Blood money:",
+            f"- Single kill: {single}",
+            f"- Multi kill: {multi}",
+            f"- Breach kill: {breach_str}",
+            f"- Death: {death}",
+            "",
+        ]
+        if d["breach"]:
+            lines.append(f"Breach: **{d['breach']}** at 20:00 BST (multi-combat, 30 min)")
+        else:
+            lines.append("Breach: none today (final day)")
+        missions = []
+        if d["m1"]:
+            missions.append(f"{d['m1']} at 16:00 BST")
+        if d["m2"]:
+            missions.append(f"{d['m2']} at 00:00 BST")
+        if missions:
+            lines.append("Missions: " + ", ".join(missions))
+        lines.append("")
+        lines.append(LINKS_LINE)
+        return "\n".join(lines)
+    return ""
+
+
+def process_events(state: dict[str, dict]) -> None:
+    now = datetime.now(timezone.utc)
+    for eid, when_str, etype, payload in SCHEDULE:
+        if eid in state:
+            continue
+        try:
+            when = datetime.fromisoformat(when_str)
+        except ValueError:
+            continue
+        fire_at = when - EVENT_LEAD if etype in ("breach", "mission") else when
+        if fire_at > now:
+            continue
+        if fire_at < now - EVENT_GRACE:
+            state[eid] = {"status": "missed"}
+            save_state(state)
+            continue
+        content = build_event_content(etype, payload)
+        if content:
+            post_webhook({"content": content}, EVENTS_WEBHOOK_URL)
+            print(f"[{time.strftime('%H:%M:%S')}] event fired: {eid}", flush=True)
+        state[eid] = {"status": "fired"}
+        save_state(state)
 
 
 def run_once(state: dict[str, dict]) -> dict[str, dict]:
@@ -201,6 +310,7 @@ def run_once(state: dict[str, dict]) -> dict[str, dict]:
         save_state(state)
         time.sleep(0.8)
 
+    process_events(state)
     return state
 
 
