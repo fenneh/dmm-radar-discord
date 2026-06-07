@@ -7,6 +7,7 @@ import os
 import sys
 import time
 import urllib.request
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 DATA_URL = "https://dmmradar.com/map/__data.json"
@@ -15,6 +16,7 @@ STATE_FILE = Path(os.environ.get("STATE_FILE", "/app/data/seen.json"))
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "45"))
 WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
 USER_AGENT = "dmm-radar-discord/0.1 (+https://github.com/fenneh)"
+WATCH_TTL = timedelta(hours=int(os.environ.get("WATCH_TTL_HOURS", "12")))
 
 TEAM_COLORS = {
     "odablock_team": 0xE67E22,
@@ -58,19 +60,32 @@ def get_state() -> tuple[list[dict], dict[str, dict]]:
     return root.get("deathPins") or [], teams
 
 
-def load_seen() -> set[str]:
+def load_state() -> dict[str, dict]:
     if not STATE_FILE.exists():
-        return set()
+        return {}
     try:
-        return set(json.loads(STATE_FILE.read_text()))
+        raw = json.loads(STATE_FILE.read_text())
     except Exception:
-        return set()
+        return {}
+    if isinstance(raw, list):
+        return {pid: {"status": "done"} for pid in raw}
+    return raw
 
 
-def save_seen(seen: set[str]) -> None:
+def save_state(state: dict[str, dict]) -> None:
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    keep = list(seen)[-5000:]
-    STATE_FILE.write_text(json.dumps(keep))
+    if len(state) > 5000:
+        state = dict(list(state.items())[-5000:])
+    STATE_FILE.write_text(json.dumps(state))
+
+
+def is_expired(created_at: str | None) -> bool:
+    if not created_at:
+        return False
+    try:
+        return datetime.fromisoformat(created_at) < datetime.now(timezone.utc) - WATCH_TTL
+    except ValueError:
+        return False
 
 
 def build_embed(pin: dict, teams: dict[str, dict]) -> dict:
@@ -127,31 +142,66 @@ def pick_clip_urls(pin: dict) -> list[str]:
     return twitch if twitch else urls
 
 
-def post_pin(pin: dict, teams: dict[str, dict]) -> None:
-    post_webhook({"embeds": [build_embed(pin, teams)]})
-    for url in pick_clip_urls(pin):
+def post_clips(urls: list[str]) -> None:
+    for url in urls:
         time.sleep(0.4)
         post_webhook({"content": url})
+
+
+def post_pin(pin: dict, teams: dict[str, dict]) -> list[str]:
+    post_webhook({"embeds": [build_embed(pin, teams)]})
+    urls = pick_clip_urls(pin)
+    post_clips(urls)
+    return urls
 
 
 def is_postable(pin: dict) -> bool:
     return pin.get("status") == "verified"
 
 
-def run_once(seen: set[str]) -> set[str]:
+def run_once(state: dict[str, dict]) -> dict[str, dict]:
     pins, teams = get_state()
-    new_pins = [p for p in pins if p.get("id") not in seen and is_postable(p)]
+    pins_by_id = {p["id"]: p for p in pins}
+
+    new_pins = [p for p in pins if p["id"] not in state and is_postable(p)]
     new_pins.sort(key=lambda p: p.get("created_at") or "")
+
+    watching = [pid for pid, v in state.items() if v.get("status") == "watching"]
     verified_total = sum(1 for p in pins if is_postable(p))
-    print(f"[{time.strftime('%H:%M:%S')}] poll: pins={len(pins)} verified={verified_total} new={len(new_pins)} seen={len(seen)}", flush=True)
-    if not new_pins:
-        return seen
+    print(
+        f"[{time.strftime('%H:%M:%S')}] poll: pins={len(pins)} verified={verified_total} "
+        f"new={len(new_pins)} watching={len(watching)} state={len(state)}",
+        flush=True,
+    )
+
     for p in new_pins:
-        post_pin(p, teams)
-        seen.add(p["id"])
-        save_seen(seen)
+        urls = post_pin(p, teams)
+        if urls:
+            state[p["id"]] = {"status": "done"}
+        else:
+            state[p["id"]] = {"status": "watching", "created_at": p.get("created_at")}
+        save_state(state)
         time.sleep(0.8)
-    return seen
+
+    for pid in watching:
+        entry = state[pid]
+        if is_expired(entry.get("created_at")):
+            state[pid] = {"status": "done"}
+            save_state(state)
+            continue
+        pin = pins_by_id.get(pid)
+        if not pin:
+            continue
+        urls = pick_clip_urls(pin)
+        if not urls:
+            continue
+        print(f"[{time.strftime('%H:%M:%S')}] clip arrived for {pid}: {len(urls)} url(s)", flush=True)
+        post_clips(urls)
+        state[pid] = {"status": "done"}
+        save_state(state)
+        time.sleep(0.8)
+
+    return state
 
 
 def cmd_preview(n: int = 3) -> None:
@@ -167,15 +217,15 @@ def cmd_preview(n: int = 3) -> None:
 
 
 def cmd_loop() -> None:
-    seen = load_seen()
-    if not seen:
-        print("first run — seeding seen set with existing pins (won't post backlog)", flush=True)
+    state = load_state()
+    if not state:
+        print("first run — seeding state with existing pins (won't post backlog)", flush=True)
         pins, _ = get_state()
-        seen = {p["id"] for p in pins if is_postable(p)}
-        save_seen(seen)
+        state = {p["id"]: {"status": "done"} for p in pins if is_postable(p)}
+        save_state(state)
     while True:
         try:
-            seen = run_once(seen)
+            state = run_once(state)
         except Exception as e:
             print(f"poll error: {e!r}", flush=True)
         time.sleep(POLL_INTERVAL)
