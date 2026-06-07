@@ -142,9 +142,10 @@ def run_once(seen: set[str]) -> set[str]:
     pins, teams = get_state()
     new_pins = [p for p in pins if p.get("id") not in seen and is_postable(p)]
     new_pins.sort(key=lambda p: p.get("created_at") or "")
+    verified_total = sum(1 for p in pins if is_postable(p))
+    print(f"[{time.strftime('%H:%M:%S')}] poll: pins={len(pins)} verified={verified_total} new={len(new_pins)} seen={len(seen)}", flush=True)
     if not new_pins:
         return seen
-    print(f"[{time.strftime('%H:%M:%S')}] posting {len(new_pins)} new pins", flush=True)
     for p in new_pins:
         post_pin(p, teams)
         seen.add(p["id"])
